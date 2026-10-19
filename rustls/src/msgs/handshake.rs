@@ -418,11 +418,13 @@ impl TlsListElement for ProtocolName {
 }
 
 wrapped_payload!(
-    /// draft-ietf-tls-trust-anchor-ids: `opaque TrustAnchorIdentifier<1..2^8-1>;`
+    /// draft-ietf-tls-trust-anchor-ids-06 §5.1: `opaque TrustAnchorID<1..32>;`
+    ///
+    /// The decoder is lenient and accepts IDs of up to 255 bytes.
     pub(crate) struct TrustAnchorId, PayloadU8<NonEmpty>,
 );
 
-/// draft-ietf-tls-trust-anchor-ids: `TrustAnchorIdentifier RequestedTrustAnchorList<0..2^16-1>`
+/// draft-ietf-tls-trust-anchor-ids-06 §5.1: `TrustAnchorID RequestedTrustAnchorList<0..2^16-1>;`
 ///
 /// Same wire shape as the ALPN protocol list, but the list may be empty.
 impl TlsListElement for TrustAnchorId {

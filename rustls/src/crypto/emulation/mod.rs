@@ -262,6 +262,9 @@ pub enum FingerprintSignatureAlgorithm {
     EcdsaSha1Legacy,
     /// GREASE signature algorithm. Advertise-only: sent in the ClientHello at its list
     /// position, never offered to the verifier.
+    ///
+    /// The value is fixed at `0x1a1a` (real Chrome draws one per connection), and only the
+    /// first `Grease` in the list is sent.
     Grease,
 }
 
@@ -945,7 +948,8 @@ mod tests {
             .with_cert_resolver(resolver.clone());
 
         // The server rejects a ClientHello that repeats an extension, so this also shows that the
-        // retried ClientHello carries `trust_anchors` once.
+        // retried ClientHello carries `trust_anchors` at most once. It is there at all because
+        // `emit_client_hello_for_retry` rebuilds the extensions from the same config.
         handshake(client_config_with(fp, roots), server_config).unwrap();
 
         // Two ClientHellos (so the server did retry), each with GREASE once, in its place.

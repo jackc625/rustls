@@ -316,6 +316,9 @@ fn emit_client_hello_for_retry(
             &mut exts.signature_schemes,
         ) {
             schemes.insert(
+                // The verifier's list isn't always built from the fingerprint (e.g.
+                // `NoVerifier::with_default_schemes()` when TLS errors are ignored), so the
+                // counted position is clamped to its length.
                 position.min(schemes.len()),
                 crate::crypto::emulation::FingerprintSignatureAlgorithm::Grease
                     .to_signature_scheme(),
