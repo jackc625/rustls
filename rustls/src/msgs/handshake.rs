@@ -424,11 +424,9 @@ wrapped_payload!(
 
 /// draft-ietf-tls-trust-anchor-ids: `TrustAnchorIdentifier RequestedTrustAnchorList<0..2^16-1>`
 ///
-/// Chrome encodes it with the same wire shape as the ALPN protocol list.
+/// Same wire shape as the ALPN protocol list, but the list may be empty.
 impl TlsListElement for TrustAnchorId {
-    const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
-        empty_error: InvalidMessage::IllegalEmptyList("TrustAnchorIds"),
-    };
+    const SIZE_LEN: ListLength = ListLength::U16;
 }
 
 /// RFC7301 encodes a single protocol name as `Vec<ProtocolName>`
@@ -3281,6 +3279,22 @@ fn low_quality_integer_hash(mut x: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_trust_anchor_list_is_accepted() {
+        let mut r = Reader::init(&[0, 0]);
+        let ids = Vec::<TrustAnchorId>::read(&mut r).unwrap();
+        assert!(ids.is_empty());
+        assert!(!r.any_left());
+
+        let mut r = Reader::init(&[0, 3, 2, 0xab, 0xcd]);
+        assert_eq!(
+            Vec::<TrustAnchorId>::read(&mut r)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn test_ech_config_dupe_exts() {

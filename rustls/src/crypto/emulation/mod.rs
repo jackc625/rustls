@@ -783,6 +783,18 @@ mod tests {
     }
 
     #[test]
+    fn empty_trust_anchor_list_is_encoded_as_empty() {
+        let mut fp = fingerprint();
+        fp.extensions.trust_anchors = Some(Vec::new());
+        let exts = client_hello_extensions(fp);
+        let body = exts
+            .iter()
+            .find(|(t, _)| *t == 0xca34)
+            .map(|(_, b)| b.clone());
+        assert_eq!(body, Some(vec![0, 0]));
+    }
+
+    #[test]
     fn trust_anchor_ids_are_not_sent_unless_configured() {
         assert!(
             !client_hello_extensions(fingerprint())
