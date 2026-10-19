@@ -1792,6 +1792,9 @@ extension_struct! {
             pub(crate) status: Option<CertificateStatus<'a>>,
         ExtensionType::SCT =>
             pub(crate) signed_certificate_timestamp: Option<PayloadU16>,
+        // draft-ietf-tls-trust-anchor-ids: an empty marker in the first entry.
+        ExtensionType::TrustAnchors =>
+            pub(crate) trust_anchors: Option<()>,
     }
 }
 
@@ -1800,6 +1803,7 @@ impl CertificateExtensions<'_> {
         CertificateExtensions {
             status: self.status.map(|s| s.into_owned()),
             signed_certificate_timestamp: self.signed_certificate_timestamp,
+            trust_anchors: self.trust_anchors,
         }
     }
 }
