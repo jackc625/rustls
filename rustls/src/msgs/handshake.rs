@@ -417,6 +417,20 @@ impl TlsListElement for ProtocolName {
     };
 }
 
+wrapped_payload!(
+    /// draft-ietf-tls-trust-anchor-ids: `opaque TrustAnchorIdentifier<1..2^8-1>;`
+    pub(crate) struct TrustAnchorId, PayloadU8<NonEmpty>,
+);
+
+/// draft-ietf-tls-trust-anchor-ids: `TrustAnchorIdentifier RequestedTrustAnchorList<0..2^16-1>`
+///
+/// Chrome encodes it with the same wire shape as the ALPN protocol list.
+impl TlsListElement for TrustAnchorId {
+    const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
+        empty_error: InvalidMessage::IllegalEmptyList("TrustAnchorIds"),
+    };
+}
+
 /// RFC7301 encodes a single protocol name as `Vec<ProtocolName>`
 #[derive(Clone, Debug)]
 pub(crate) struct SingleProtocolName(ProtocolName);
@@ -993,6 +1007,10 @@ extension_struct! {
         ExtensionType::ApplicationSettingsNew =>
             pub(crate) application_settings_new: Option<PayloadU16>,
 
+        /// Trust Anchor IDs (draft-ietf-tls-trust-anchor-ids, codepoint 0xca34)
+        ExtensionType::TrustAnchors =>
+            pub(crate) trust_anchors: Option<Vec<TrustAnchorId>>,
+
         /// Padding extension (RFC7685) - used to pad ClientHello to avoid triggering
         /// bugs in some middleboxes. Contains zero bytes.
         ExtensionType::Padding =>
@@ -1040,6 +1058,7 @@ impl ClientExtensions<'_> {
             order_seed,
             application_settings,
             application_settings_new,
+            trust_anchors,
             reserved_grease,
             signed_certificate_timestamp,
             delegated_credentials,
@@ -1076,6 +1095,7 @@ impl ClientExtensions<'_> {
             contiguous_extensions,
             application_settings,
             application_settings_new,
+            trust_anchors,
             reserved_grease,
             signed_certificate_timestamp,
             delegated_credentials,

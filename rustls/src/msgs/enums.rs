@@ -152,6 +152,7 @@ enum_builder! {
         RecordSizeLimit => 0x001c,
         ApplicationSettings => 0x4469, // Old ALPS codepoint (17513)
         ApplicationSettingsNew => 0x44cd, // New ALPS codepoint (17613) used by Chrome 136+
+        TrustAnchors => 0xca34, // draft-ietf-tls-trust-anchor-ids, Chrome's codepoint
     }
 }
 

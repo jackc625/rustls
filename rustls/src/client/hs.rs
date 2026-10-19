@@ -285,6 +285,15 @@ fn emit_client_hello_for_retry(
             }
         }
 
+        if let Some(ids) = &ext_config.trust_anchors {
+            exts.trust_anchors = Some(
+                ids.iter()
+                    .cloned()
+                    .map(crate::msgs::handshake::TrustAnchorId::from)
+                    .collect(),
+            );
+        }
+
         if ext_config.delegated_credentials {
             // TODO: We don't really support the delegated credentials extension yet, just sending it in the client hello message
             let delegated_credentials_signature_algos =

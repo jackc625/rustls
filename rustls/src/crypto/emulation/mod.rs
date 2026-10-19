@@ -310,6 +310,9 @@ pub struct TlsExtensionsConfig {
     pub delegated_credentials: bool,
     /// Whether to send record_size_limit extension
     pub record_size_limit: Option<u16>,
+    /// Trust Anchor IDs (draft-ietf-tls-trust-anchor-ids, Chrome's codepoint `0xca34`) to
+    /// advertise, each 1-32 bytes; `None` sends nothing.
+    pub trust_anchors: Option<Vec<Vec<u8>>>,
     /// Whether to send renegotiation_info extension
     pub renegotiation_info: bool,
     /// Whether to send padding extension (RFC7685)
@@ -705,15 +708,87 @@ mod tests {
     /// Builds a client the way impit does: a provider derived from the fingerprint, which
     /// supplies the signature verification algorithms used by the certificate verifier.
     fn client_config(roots: RootCertStore) -> ClientConfig {
+        client_config_with(fingerprint(), roots)
+    }
+
+    /// Like `client_config`, for an arbitrary fingerprint (set on both the provider and the config).
+    fn client_config_with(fp: TlsFingerprint, roots: RootCertStore) -> ClientConfig {
         let provider = CryptoProvider::builder()
-            .with_tls_fingerprint(fingerprint())
+            .with_tls_fingerprint(fp.clone())
             .build();
         ClientConfig::builder_with_provider(Arc::new(provider))
             .with_protocol_versions(&[&TLS13])
             .unwrap()
             .with_root_certificates(roots)
-            .with_tls_fingerprint(fingerprint())
+            .with_tls_fingerprint(fp)
             .with_no_client_auth()
+    }
+
+    /// The ClientHello extensions `fp` produces, as (type, body) in wire order.
+    fn client_hello_extensions(fp: TlsFingerprint) -> Vec<(u16, Vec<u8>)> {
+        let mut conn = ClientConnection::new(
+            Arc::new(client_config_with(fp, RootCertStore::empty())),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut record = Vec::new();
+        conn.write_tls(&mut record).unwrap();
+
+        // Skip the record (5) and handshake (4) headers.
+        let hello = &record[9..];
+        let u16_at = |i: usize| usize::from(u16::from_be_bytes([hello[i], hello[i + 1]]));
+        let mut i = 2 + 32; // legacy_version, random
+        i += 1 + usize::from(hello[i]); // legacy_session_id
+        i += 2 + u16_at(i); // cipher_suites
+        i += 1 + usize::from(hello[i]); // legacy_compression_methods
+        let end = i + 2 + u16_at(i);
+        i += 2;
+        let mut extensions = Vec::new();
+        while i < end {
+            let body_end = i + 4 + u16_at(i + 2);
+            extensions.push((u16_at(i) as u16, hello[i + 4..body_end].to_vec()));
+            i = body_end;
+        }
+        assert_eq!(i, end, "ClientHello extensions not parsed");
+        extensions
+    }
+
+    /// Chrome 155's Trust Anchor IDs extension body: 28 IDs.
+    const CHROME_155_TRUST_ANCHORS: &str = "00b80582df1302010582df1302060582df13020d0582df13020e0582df13020f0582df1302120582df1302130582df13021408839a648c9b2d010708839a648c9b2d010808839a648c9b2d010908839a648c9b2d010a08839a648c9b2d010b08839a648c9b2d010c08839a648c9b2d010d08839a648c9b2d011208839a648c9b2d011304d679090104d679090404d679090504d679090604d679090704d679090804d679090a04d679090b04d679090c04d679090d04d679090f";
+
+    /// Splits a RequestedTrustAnchorList (u16 length, then u8-prefixed IDs) into its IDs.
+    fn chrome_28_ids() -> Vec<Vec<u8>> {
+        let body = hex::decode(CHROME_155_TRUST_ANCHORS).unwrap();
+        let mut ids = Vec::new();
+        let mut rest = &body[2..];
+        while let Some((&len, tail)) = rest.split_first() {
+            let (id, tail) = tail.split_at(usize::from(len));
+            ids.push(id.to_vec());
+            rest = tail;
+        }
+        ids
+    }
+
+    #[test]
+    fn trust_anchor_ids_are_encoded_like_chrome() {
+        let mut fp = fingerprint();
+        fp.extensions.trust_anchors = Some(chrome_28_ids());
+        assert_eq!(chrome_28_ids().len(), 28);
+        let exts = client_hello_extensions(fp);
+        let body = exts
+            .iter()
+            .find(|(t, _)| *t == 0xca34)
+            .map(|(_, b)| b.clone());
+        assert_eq!(body, Some(hex::decode(CHROME_155_TRUST_ANCHORS).unwrap()));
+    }
+
+    #[test]
+    fn trust_anchor_ids_are_not_sent_unless_configured() {
+        assert!(
+            !client_hello_extensions(fingerprint())
+                .iter()
+                .any(|(t, _)| *t == 0xca34)
+        );
     }
 
     fn server_config_builder() -> ConfigBuilder<ServerConfig, WantsServerCert> {
