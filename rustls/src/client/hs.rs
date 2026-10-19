@@ -308,6 +308,19 @@ fn emit_client_hello_for_retry(
         if let Some(record_size_limit) = ext_config.record_size_limit {
             exts.record_size_limit = Some(record_size_limit);
         }
+
+        // `signature_schemes` comes from the verifier, which never holds GREASE: add it here, at
+        // the fingerprint's position.
+        if let (Some(position), Some(schemes)) = (
+            fingerprint.signature_algorithm_grease_position(),
+            &mut exts.signature_schemes,
+        ) {
+            schemes.insert(
+                position.min(schemes.len()),
+                crate::crypto::emulation::FingerprintSignatureAlgorithm::Grease
+                    .to_signature_scheme(),
+            );
+        }
     }
 
     if !config

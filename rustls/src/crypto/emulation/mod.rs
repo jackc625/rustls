@@ -260,6 +260,9 @@ pub enum FingerprintSignatureAlgorithm {
     MlDsa87,
     // Legacy
     EcdsaSha1Legacy,
+    /// GREASE signature algorithm. Advertise-only: sent in the ClientHello at its list
+    /// position, never offered to the verifier.
+    Grease,
 }
 
 impl FingerprintSignatureAlgorithm {
@@ -282,6 +285,7 @@ impl FingerprintSignatureAlgorithm {
             Self::MlDsa65 => SignatureScheme::ML_DSA_65,
             Self::MlDsa87 => SignatureScheme::ML_DSA_87,
             Self::EcdsaSha1Legacy => SignatureScheme::ECDSA_SHA1_Legacy,
+            Self::Grease => SignatureScheme::Unknown(0x1a1a),
         }
     }
 }
@@ -435,6 +439,8 @@ impl FingerprintSignatureAlgorithm {
             Self::MlDsa87 => ML_DSA_87_ALGS,
             // Ed448 is not supported by webpki, SHA1 legacy uses fallback in mapping
             Self::Ed448 | Self::RsaPkcs1Sha1 | Self::EcdsaSha1Legacy => EMPTY,
+            // GREASE has nothing to verify
+            Self::Grease => EMPTY,
         }
     }
 
@@ -509,6 +515,9 @@ impl FingerprintSignatureAlgorithm {
             Self::MlDsa44 => Some((SignatureScheme::ML_DSA_44, ML_DSA_44)),
             Self::MlDsa65 => Some((SignatureScheme::ML_DSA_65, ML_DSA_65)),
             Self::MlDsa87 => Some((SignatureScheme::ML_DSA_87, ML_DSA_87)),
+            // Never in the mapping: an entry with no algorithms would make
+            // `verify_tls13_signature` panic on a server that picks GREASE.
+            Self::Grease => None,
         }
     }
 }
@@ -612,12 +621,30 @@ impl TlsFingerprint {
     pub fn to_signature_verification_algorithms(&self) -> WebPkiSupportedAlgorithms {
         sig_alg_cache::get_or_create(&self.signature_algorithms)
     }
+
+    /// Where GREASE goes in the ClientHello's `signature_algorithms`, if the fingerprint lists it.
+    ///
+    /// That list comes from the verification algorithms, which hold only the entries that have a
+    /// mapping, so the position counts only those.
+    pub(crate) fn signature_algorithm_grease_position(&self) -> Option<usize> {
+        let grease = self
+            .signature_algorithms
+            .iter()
+            .position(|sa| *sa == FingerprintSignatureAlgorithm::Grease)?;
+        Some(
+            self.signature_algorithms[..grease]
+                .iter()
+                .filter(|sa| sa.to_mapping_entry().is_some())
+                .count(),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use alloc::boxed::Box;
     use alloc::vec;
+    use std::sync::Mutex;
 
     use pki_types::{CertificateDer, PrivateKeyDer, ServerName};
     use rcgen::{
@@ -627,13 +654,14 @@ mod tests {
 
     use super::*;
     use crate::crypto::CryptoProvider;
-    use crate::server::WantsServerCert;
+    use crate::server::{ClientHello, ResolvesServerCert, WantsServerCert};
     use crate::sign::{CertifiedKey, Signer, SigningKey, SingleCertAndKey};
     use crate::sync::Arc;
+    use crate::verify::DigitallySignedStruct;
     use crate::version::TLS13;
     use crate::{
         CertificateError, ClientConfig, ClientConnection, ConfigBuilder, Connection, Error,
-        RootCertStore, ServerConfig, ServerConnection, SignatureAlgorithm,
+        PeerMisbehaved, RootCertStore, ServerConfig, ServerConnection, SignatureAlgorithm,
     };
 
     #[test]
@@ -801,6 +829,150 @@ mod tests {
                 .iter()
                 .any(|(t, _)| *t == 0xca34)
         );
+    }
+
+    /// `fingerprint()` plus what Chrome 152+ adds: GREASE first in `signature_algorithms`, and
+    /// Trust Anchor IDs.
+    fn chrome_152_fingerprint() -> TlsFingerprint {
+        let mut fp = fingerprint();
+        fp.signature_algorithms = vec![
+            FingerprintSignatureAlgorithm::Grease,
+            FingerprintSignatureAlgorithm::EcdsaSecp256r1Sha256,
+            FingerprintSignatureAlgorithm::RsaPssRsaSha256,
+        ];
+        fp.extensions.trust_anchors = Some(chrome_28_ids());
+        fp
+    }
+
+    /// The `signature_algorithms` extension body `fp` sends.
+    fn sent_signature_algorithms(fp: TlsFingerprint) -> Option<Vec<u8>> {
+        client_hello_extensions(fp)
+            .into_iter()
+            .find(|(t, _)| *t == 0x000d)
+            .map(|(_, body)| body)
+    }
+
+    #[test]
+    fn grease_signature_algorithm_is_sent_in_place() {
+        assert_eq!(
+            sent_signature_algorithms(chrome_152_fingerprint()),
+            Some(vec![0x00, 0x06, 0x1a, 0x1a, 0x04, 0x03, 0x08, 0x04])
+        );
+
+        // Ed448 never reaches the wire, so it doesn't count towards GREASE's position.
+        let mut fp = fingerprint();
+        fp.signature_algorithms = vec![
+            FingerprintSignatureAlgorithm::Ed448,
+            FingerprintSignatureAlgorithm::Grease,
+            FingerprintSignatureAlgorithm::EcdsaSecp256r1Sha256,
+        ];
+        assert_eq!(
+            sent_signature_algorithms(fp),
+            Some(vec![0x00, 0x04, 0x1a, 0x1a, 0x04, 0x03])
+        );
+    }
+
+    #[test]
+    fn grease_signature_algorithm_is_not_verifiable() {
+        let algs = chrome_152_fingerprint().to_signature_verification_algorithms();
+        assert_eq!(
+            algs.supported_schemes(),
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PSS_SHA256
+            ]
+        );
+
+        // A CertificateVerify that claims the GREASE value is refused, without a panic.
+        let (_, ee_cert, _) = issue(
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+        );
+        let dss = DigitallySignedStruct::new(SignatureScheme::Unknown(0x1a1a), vec![0; 64]);
+        let err =
+            crate::crypto::verify_tls13_signature(b"message", &ee_cert, &dss, &algs).unwrap_err();
+        assert_eq!(
+            err,
+            Error::PeerMisbehaved(PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme)
+        );
+    }
+
+    #[test]
+    fn handshake_with_trust_anchors_and_grease_sigalg_succeeds() {
+        let (roots, ee_cert, ee_key) = issue(
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+        );
+        let server_config = server_config_builder()
+            .with_single_cert(vec![ee_cert], ee_key)
+            .unwrap();
+
+        handshake(
+            client_config_with(chrome_152_fingerprint(), roots),
+            server_config,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn handshake_after_hello_retry_keeps_one_copy_of_each() {
+        // The client's key share is P-256, which this server can't use, so it asks for P-384.
+        let mut fp = chrome_152_fingerprint();
+        fp.key_exchange_groups = vec![
+            FingerprintKeyExchangeGroup::Secp256r1,
+            FingerprintKeyExchangeGroup::Secp384r1,
+        ];
+        let (roots, ee_cert, ee_key) = issue(
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+        );
+        let ee_key = aws_lc_rs::default_provider()
+            .key_provider
+            .load_private_key(ee_key)
+            .unwrap();
+        let resolver = Arc::new(RecordSignatureSchemes {
+            key: Arc::new(CertifiedKey::new(vec![ee_cert], ee_key)),
+            seen: Mutex::default(),
+        });
+        let p384_only = CryptoProvider {
+            kx_groups: vec![aws_lc_rs::kx_group::SECP384R1],
+            ..aws_lc_rs::default_provider()
+        };
+        let server_config = ServerConfig::builder_with_provider(Arc::new(p384_only))
+            .with_protocol_versions(&[&TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver.clone());
+
+        // The server rejects a ClientHello that repeats an extension, so this also shows that the
+        // retried ClientHello carries `trust_anchors` once.
+        handshake(client_config_with(fp, roots), server_config).unwrap();
+
+        // Two ClientHellos (so the server did retry), each with GREASE once, in its place.
+        let sent = vec![
+            SignatureScheme::Unknown(0x1a1a),
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PSS_SHA256,
+        ];
+        assert_eq!(*resolver.seen.lock().unwrap(), vec![sent.clone(), sent]);
+    }
+
+    /// Serves one certificate, recording the `signature_algorithms` of each ClientHello.
+    #[derive(Debug)]
+    struct RecordSignatureSchemes {
+        key: Arc<CertifiedKey>,
+        seen: Mutex<Vec<Vec<SignatureScheme>>>,
+    }
+
+    impl ResolvesServerCert for RecordSignatureSchemes {
+        fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            self.seen.lock().unwrap().push(
+                client_hello
+                    .signature_schemes()
+                    .to_vec(),
+            );
+            Some(self.key.clone())
+        }
     }
 
     fn server_config_builder() -> ConfigBuilder<ServerConfig, WantsServerCert> {
