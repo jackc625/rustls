@@ -1101,13 +1101,15 @@ impl State<ClientConnectionData> for ExpectCompressedCertificate {
     }
 }
 
-/// Whether the first certificate entry carries a `trust_anchors` marker we did not ask for.
+/// Whether any certificate entry carries a `trust_anchors` marker we did not ask for.
+///
+/// When we did send the extension, the marker is tolerated in any entry.
 fn unsolicited_trust_anchors(chain: &CertificatePayloadTls13<'_>, sent: bool) -> bool {
     !sent
         && chain
             .entries
-            .first()
-            .is_some_and(|entry| entry.extensions.trust_anchors.is_some())
+            .iter()
+            .any(|entry| entry.extensions.trust_anchors.is_some())
 }
 
 /// Whether this client's fingerprint offers the Trust Anchor IDs extension.
@@ -1775,6 +1777,16 @@ mod tests {
     use super::*;
     use crate::msgs::handshake::{CertificateEntry, CertificatePayloadTls13};
 
+    fn chain_with_marker_on_second(marker: bool) -> CertificatePayloadTls13<'static> {
+        let mut chain = chain(false);
+        let mut second = CertificateEntry::new(CertificateDer::from(vec![4, 5, 6]));
+        if marker {
+            second.extensions.trust_anchors = Some(());
+        }
+        chain.entries.push(second);
+        chain
+    }
+
     fn chain(marker: bool) -> CertificatePayloadTls13<'static> {
         let mut entry = CertificateEntry::new(CertificateDer::from(vec![1, 2, 3]));
         if marker {
@@ -1792,5 +1804,21 @@ mod tests {
         assert!(!unsolicited_trust_anchors(&chain(true), true));
         assert!(!unsolicited_trust_anchors(&chain(false), false));
         assert!(!unsolicited_trust_anchors(&chain(false), true));
+    }
+
+    #[test]
+    fn trust_anchors_marker_on_later_entry_rejected_when_not_sent() {
+        assert!(unsolicited_trust_anchors(
+            &chain_with_marker_on_second(true),
+            false
+        ));
+        assert!(!unsolicited_trust_anchors(
+            &chain_with_marker_on_second(true),
+            true
+        ));
+        assert!(!unsolicited_trust_anchors(
+            &chain_with_marker_on_second(false),
+            false
+        ));
     }
 }
