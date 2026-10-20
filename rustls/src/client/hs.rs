@@ -267,6 +267,12 @@ fn emit_client_hello_for_retry(
             exts.reserved_grease = Some(());
         }
 
+        if ext_config.grease_first_and_last {
+            // The encoder puts these first and last (`used_extensions_in_encoding_order`).
+            exts.reserved_grease = Some(());
+            exts.reserved_grease_last = Some(Payload::new(vec![0]));
+        }
+
         if ext_config.signed_certificate_timestamp {
             exts.signed_certificate_timestamp = Some(());
         }

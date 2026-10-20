@@ -306,6 +306,9 @@ pub enum FingerprintCertCompressionAlgorithm {
 pub struct TlsExtensionsConfig {
     /// Whether to send GREASE extensions
     pub grease: bool,
+    /// Send Chrome's two GREASE extensions: `0xbaba` with an empty body first, and `0xaaaa` with
+    /// body `00` last (before padding and `pre_shared_key`). The rest of the order is unchanged.
+    pub grease_first_and_last: bool,
     /// Whether to send signed_certificate_timestamp extension
     pub signed_certificate_timestamp: bool,
     /// Whether to send application_settings extension
@@ -655,14 +658,20 @@ mod tests {
     use alloc::vec;
     use std::sync::Mutex;
 
-    use pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+    use pki_types::{CertificateDer, DnsName, EchConfigListBytes, PrivateKeyDer, ServerName};
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
         KeyPair, KeyUsagePurpose,
     };
 
     use super::*;
+    use crate::client::{EchConfig, EchGreaseConfig, EchMode};
     use crate::crypto::CryptoProvider;
+    use crate::crypto::aws_lc_rs::hpke::DH_KEM_P256_HKDF_SHA256_AES_128;
+    use crate::crypto::hpke::Hpke;
+    use crate::msgs::base::PayloadU16;
+    use crate::msgs::codec::Codec;
+    use crate::msgs::handshake::{EchConfigContents, EchConfigPayload, HpkeKeyConfig};
     #[cfg(feature = "tls12")]
     use crate::server::Acceptor;
     use crate::server::{ClientHello, ResolvesServerCert, WantsServerCert};
@@ -789,7 +798,14 @@ mod tests {
         conn.write_tls(&mut record).unwrap();
 
         // Skip the record (5) and handshake (4) headers.
-        let hello = &record[9..];
+        extensions_of(&record[9..])
+    }
+
+    /// A ClientHello's extensions, as (type, body) in wire order.
+    type Extensions = Vec<(u16, Vec<u8>)>;
+
+    /// The extensions of a ClientHello body (after the handshake header).
+    fn extensions_of(hello: &[u8]) -> Extensions {
         let u16_at = |i: usize| usize::from(u16::from_be_bytes([hello[i], hello[i + 1]]));
         let mut i = 2 + 32; // legacy_version, random
         i += 1 + usize::from(hello[i]); // legacy_session_id
@@ -857,8 +873,153 @@ mod tests {
         );
     }
 
-    /// `fingerprint()` plus what Chrome 152+ adds: GREASE first in `signature_algorithms`, and
-    /// Trust Anchor IDs.
+    /// `fp` with Chrome's two GREASE extensions turned on.
+    fn greased(mut fp: TlsFingerprint) -> TlsFingerprint {
+        fp.extensions.grease_first_and_last = true;
+        fp
+    }
+
+    /// The types of `exts`, in order, asserting that none occurs twice.
+    fn distinct_types(exts: &[(u16, Vec<u8>)]) -> Vec<u16> {
+        let types: Vec<u16> = exts.iter().map(|(t, _)| *t).collect();
+        for (i, t) in types.iter().enumerate() {
+            assert!(
+                !types[i + 1..].contains(t),
+                "{t:#06x} twice in {types:04x?}"
+            );
+        }
+        types
+    }
+
+    /// Asserts that `exts` starts with the empty GREASE extension, ends with the one-byte one,
+    /// and has no type twice.
+    fn assert_grease_first_and_last(exts: &[(u16, Vec<u8>)]) {
+        distinct_types(exts);
+        assert_eq!(exts[0], (0xbaba, vec![]));
+        assert_eq!(*exts.last().unwrap(), (0xaaaa, vec![0]));
+    }
+
+    #[test]
+    fn grease_extensions_go_first_and_last() {
+        assert_grease_first_and_last(&client_hello_extensions(greased(fingerprint())));
+    }
+
+    #[test]
+    fn grease_extensions_are_not_sent_unless_configured() {
+        let types = distinct_types(&client_hello_extensions(fingerprint()));
+        assert!(!types.contains(&0xbaba), "{types:04x?}");
+        assert!(!types.contains(&0xaaaa), "{types:04x?}");
+    }
+
+    #[test]
+    fn listed_grease_is_sent_once_and_first() {
+        let mut fp = greased(fingerprint());
+        fp.extensions.grease = true;
+        fp.extensions.extension_order = vec![
+            ExtensionType::SupportedVersions,
+            ExtensionType::ReservedGrease,
+            ExtensionType::KeyShare,
+        ];
+        let exts = client_hello_extensions(fp);
+        assert_grease_first_and_last(&exts);
+
+        // The rest of the listed order stays as it was.
+        let types = distinct_types(&exts);
+        assert!(
+            types
+                .windows(2)
+                .any(|pair| pair == [0x002b, 0x0033]),
+            "{types:04x?}"
+        );
+    }
+
+    #[test]
+    fn padding_follows_the_last_grease_extension() {
+        let mut fp = greased(fingerprint());
+        fp.extensions.padding = true;
+        let exts = client_hello_extensions(fp);
+        distinct_types(&exts);
+        assert_eq!(exts[0], (0xbaba, vec![]));
+        assert_eq!(
+            exts[exts.len() - 2..],
+            [(0xaaaa, vec![0]), (0x0015, vec![])]
+        );
+    }
+
+    /// A client for `fp` that sends ECH as `ech_mode` says.
+    fn client_config_with_ech(fp: TlsFingerprint, ech_mode: EchMode) -> ClientConfig {
+        let provider = CryptoProvider::builder()
+            .with_tls_fingerprint(fp.clone())
+            .build();
+        ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_ech(ech_mode)
+            .unwrap()
+            .with_root_certificates(RootCertStore::empty())
+            .with_tls_fingerprint(fp)
+            .with_no_client_auth()
+    }
+
+    // ECH uses P-256 HPKE, not impit's X25519: `fips` builds have no X25519 HPKE suites.
+    static ECH_SUITE: &dyn Hpke = DH_KEM_P256_HKDF_SHA256_AES_128;
+
+    #[test]
+    fn last_grease_extension_follows_grease_ech() {
+        let (public_key, _) = ECH_SUITE.generate_key_pair().unwrap();
+        let ech_mode = EchMode::Grease(EchGreaseConfig::new(ECH_SUITE, public_key));
+        let exts = hello_extensions(client_config_with_ech(greased(fingerprint()), ech_mode));
+        assert_grease_first_and_last(&exts);
+
+        let types = distinct_types(&exts);
+        assert_eq!(types[types.len() - 2..], [0xfe0d, 0xaaaa]);
+    }
+
+    #[test]
+    fn real_ech_hello_keeps_grease_first_and_last() {
+        // An ECHConfigList with one config, as a server would publish it.
+        let (public_key, _) = ECH_SUITE.generate_key_pair().unwrap();
+        let config = EchConfigPayload::V18(EchConfigContents {
+            key_config: HpkeKeyConfig {
+                config_id: 7,
+                kem_id: ECH_SUITE.suite().kem,
+                public_key: PayloadU16::new(public_key.0),
+                symmetric_cipher_suites: vec![ECH_SUITE.suite().sym],
+            },
+            maximum_name_length: 0,
+            public_name: DnsName::try_from("public.example").unwrap(),
+            extensions: Vec::new(),
+        });
+        let config_list = EchConfigListBytes::from(vec![config].get_encoding());
+        let ech_mode = EchMode::Enable(EchConfig::new(config_list, &[ECH_SUITE]).unwrap());
+
+        let exts = hello_extensions(client_config_with_ech(greased(fingerprint()), ech_mode));
+        assert_grease_first_and_last(&exts);
+
+        let types = distinct_types(&exts);
+        assert_eq!(types[types.len() - 2..], [0xfe0d, 0xaaaa]);
+    }
+
+    #[test]
+    fn pre_shared_key_stays_last_after_grease() {
+        let (roots, ee_cert, ee_key) = issue(
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+        );
+        let server_config = server_config_builder()
+            .with_single_cert(vec![ee_cert], ee_key)
+            .unwrap();
+        let config = client_config_with(greased(fingerprint()), roots);
+
+        // The first handshake leaves a ticket in the session store that `config` shares.
+        handshake(config.clone(), server_config).unwrap();
+
+        let exts = hello_extensions(config);
+        assert_eq!(exts[0], (0xbaba, vec![]));
+        let types = distinct_types(&exts);
+        assert_eq!(types[types.len() - 2..], [0xaaaa, 0x0029]);
+    }
+
+    /// `fingerprint()` plus what Chrome 152+ adds: GREASE first in `signature_algorithms`, Trust
+    /// Anchor IDs, and the two GREASE extensions.
     fn chrome_152_fingerprint() -> TlsFingerprint {
         let mut fp = fingerprint();
         fp.signature_algorithms = vec![
@@ -867,7 +1028,7 @@ mod tests {
             FingerprintSignatureAlgorithm::RsaPssRsaSha256,
         ];
         fp.extensions.trust_anchors = Some(chrome_28_ids());
-        fp
+        greased(fp)
     }
 
     /// The `signature_algorithms` extension body `fp` sends.
@@ -1094,10 +1255,12 @@ mod tests {
             .with_no_client_auth()
             .with_cert_resolver(resolver.clone());
 
-        // The server rejects a ClientHello that repeats an extension, so this also shows that the
-        // retried ClientHello carries `trust_anchors` at most once. It is there at all because
-        // `emit_client_hello_for_retry` rebuilds the extensions from the same config.
-        handshake(client_config_with(fp, roots), server_config).unwrap();
+        // The server rejects a ClientHello that repeats an extension, and the loop below checks
+        // that each one carries `trust_anchors`, so the retried ClientHello has it exactly once.
+        // It is there because `emit_client_hello_for_retry` rebuilds the extensions from the same
+        // config.
+        let hellos =
+            handshake_recording_hellos(client_config_with(fp, roots), server_config).unwrap();
 
         // Two ClientHellos (so the server did retry), each with GREASE once, in its place.
         let sent = vec![
@@ -1106,6 +1269,17 @@ mod tests {
             SignatureScheme::RSA_PSS_SHA256,
         ];
         assert_eq!(*resolver.seen.lock().unwrap(), vec![sent.clone(), sent]);
+
+        // Both start with the empty GREASE extension, end with the one-byte one and carry
+        // `trust_anchors`.
+        assert_eq!(hellos.len(), 2);
+        for exts in &hellos {
+            assert_grease_first_and_last(exts);
+            assert!(
+                exts.iter().any(|(t, _)| *t == 0xca34),
+                "a ClientHello lacks trust_anchors"
+            );
+        }
     }
 
     #[cfg(feature = "tls12")]
@@ -1206,6 +1380,14 @@ mod tests {
 
     /// Runs a handshake to completion, returning the first error either side reports.
     fn handshake(client_config: ClientConfig, server_config: ServerConfig) -> Result<(), Error> {
+        handshake_recording_hellos(client_config, server_config).map(|_| ())
+    }
+
+    /// Like `handshake`, returning the extensions of each ClientHello the client sent.
+    fn handshake_recording_hellos(
+        client_config: ClientConfig,
+        server_config: ServerConfig,
+    ) -> Result<Vec<Extensions>, Error> {
         let mut client = Connection::from(
             ClientConnection::new(
                 Arc::new(client_config),
@@ -1214,7 +1396,23 @@ mod tests {
             .unwrap(),
         );
         let mut server = Connection::from(ServerConnection::new(Arc::new(server_config)).unwrap());
-        finish_handshake(&mut client, &mut server)
+        let client_flights = finish_handshake_recording(&mut client, &mut server)?;
+
+        // Each ClientHello is a plaintext handshake record (22) of its own, holding a ClientHello
+        // message (1); skip the record (5) and handshake (4) headers.
+        let mut hellos = Vec::new();
+        for flight in client_flights {
+            let mut rest = &flight[..];
+            while !rest.is_empty() {
+                let len = usize::from(u16::from_be_bytes([rest[3], rest[4]]));
+                let (record, tail) = rest.split_at(5 + len);
+                if record[0] == 22 && record[5] == 1 {
+                    hellos.push(extensions_of(&record[9..]));
+                }
+                rest = tail;
+            }
+        }
+        Ok(hellos)
     }
 
     /// Like `handshake`, with the server started from an `Acceptor`. Returns the signature schemes
@@ -1262,17 +1460,31 @@ mod tests {
 
     /// Exchanges flights until neither side is handshaking.
     fn finish_handshake(client: &mut Connection, server: &mut Connection) -> Result<(), Error> {
-        while client.is_handshaking() || server.is_handshaking() {
-            let client_sent = transfer(client, server)?;
-            let server_sent = transfer(server, client)?;
-            assert!(client_sent || server_sent, "handshake stalled");
-        }
-        Ok(())
+        finish_handshake_recording(client, server).map(|_| ())
     }
 
-    /// Moves everything `from` has queued into `to`. ML-DSA flights are several kilobytes, more
-    /// than a single `read_tls()` call accepts, so both directions loop until drained.
-    fn transfer(from: &mut Connection, to: &mut Connection) -> Result<bool, Error> {
+    /// Like `finish_handshake`, returning the TLS records of each flight the client sent.
+    fn finish_handshake_recording(
+        client: &mut Connection,
+        server: &mut Connection,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        let mut client_flights = Vec::new();
+        while client.is_handshaking() || server.is_handshaking() {
+            let client_flight = transfer(client, server)?;
+            let server_flight = transfer(server, client)?;
+            assert!(
+                !client_flight.is_empty() || !server_flight.is_empty(),
+                "handshake stalled"
+            );
+            client_flights.push(client_flight);
+        }
+        Ok(client_flights)
+    }
+
+    /// Moves everything `from` has queued into `to`, returning it. ML-DSA flights are several
+    /// kilobytes, more than a single `read_tls()` call accepts, so both directions loop until
+    /// drained.
+    fn transfer(from: &mut Connection, to: &mut Connection) -> Result<Vec<u8>, Error> {
         let mut buf = Vec::new();
         while from.wants_write() {
             from.write_tls(&mut buf).unwrap();
@@ -1284,7 +1496,7 @@ mod tests {
             assert_ne!(read, 0, "read_tls made no progress");
             to.process_new_packets()?;
         }
-        Ok(!buf.is_empty())
+        Ok(buf)
     }
 
     /// Signs with an Ed25519 key but labels the signature as ML-DSA-44.

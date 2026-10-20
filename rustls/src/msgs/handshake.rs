@@ -987,6 +987,10 @@ extension_struct! {
         ExtensionType::ReservedGrease =>
             pub(crate) reserved_grease: Option<()>,
 
+        /// Bogus impit extension: the second GREASE extension, sent last. Any body on read.
+        ExtensionType::ReservedGreaseLast =>
+            pub(crate) reserved_grease_last: Option<Payload<'a>>,
+
         /// Bogus impit extension
         ExtensionType::SCT =>
             pub(crate) signed_certificate_timestamp: Option<()>,
@@ -1060,6 +1064,7 @@ impl ClientExtensions<'_> {
             application_settings_new,
             trust_anchors,
             reserved_grease,
+            reserved_grease_last,
             signed_certificate_timestamp,
             delegated_credentials,
             record_size_limit,
@@ -1097,6 +1102,7 @@ impl ClientExtensions<'_> {
             application_settings_new,
             trust_anchors,
             reserved_grease,
+            reserved_grease_last: reserved_grease_last.map(|x| x.into_owned()),
             signed_certificate_timestamp,
             delegated_credentials,
             record_size_limit,
@@ -1108,6 +1114,26 @@ impl ClientExtensions<'_> {
         let mut exts = self.order_insensitive_extensions_in_random_order();
         exts.extend(&self.contiguous_extensions);
 
+        // With `reserved_grease_last` (impit's `grease_first_and_last`), place the GREASE
+        // extensions as BoringSSL does: `ReservedGrease` first, `ReservedGreaseLast` after
+        // everything but padding and PSK. Without it, nothing moves.
+        // This only orders hellos the client builds: a received hello (where a peer's `0xaaaa`
+        // also sets the field) is never re-encoded, as the server works from its raw bytes.
+        let grease_first_and_last = self.reserved_grease_last.is_some();
+        if grease_first_and_last {
+            exts.retain(|ext| {
+                !matches!(
+                    ext,
+                    ExtensionType::ReservedGrease
+                        | ExtensionType::ReservedGreaseLast
+                        | ExtensionType::Padding
+                )
+            });
+            if self.reserved_grease.is_some() {
+                exts.insert(0, ExtensionType::ReservedGrease);
+            }
+        }
+
         if self
             .encrypted_client_hello_outer
             .is_some()
@@ -1116,6 +1142,12 @@ impl ClientExtensions<'_> {
         }
         if self.encrypted_client_hello.is_some() {
             exts.push(ExtensionType::EncryptedClientHello);
+        }
+        if grease_first_and_last {
+            exts.push(ExtensionType::ReservedGreaseLast);
+            if self.padding.is_some() {
+                exts.push(ExtensionType::Padding);
+            }
         }
         if self.preshared_key_offer.is_some() {
             exts.push(ExtensionType::PreSharedKey);
@@ -1136,6 +1168,9 @@ impl ClientExtensions<'_> {
     ///
     /// - Lastly, any ECH and PSK extensions (in that order).  These
     ///   are required to be last by the standard.
+    ///
+    /// When `reserved_grease_last` is set, the GREASE extensions and padding are taken out of
+    /// the first two portions and placed around them (see `used_extensions_in_encoding_order`).
     fn order_insensitive_extensions_in_random_order(&self) -> Vec<ExtensionType> {
         let mut order = self.collect_used();
 
@@ -3300,6 +3335,28 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn client_extensions_accept_any_grease_last_body() {
+        // A peer may send `0xaaaa` with any body (Chrome's first GREASE extension can be `0xaaaa`,
+        // empty), as when it was an unknown type.
+        for (bytes, body) in [
+            (&[0x00, 0x04, 0xaa, 0xaa, 0x00, 0x00][..], &[][..]),
+            (
+                &[0x00, 0x06, 0xaa, 0xaa, 0x00, 0x02, 0x01, 0x02][..],
+                &[0x01, 0x02][..],
+            ),
+        ] {
+            let exts = ClientExtensions::read_bytes(bytes).unwrap();
+            assert_eq!(
+                exts.reserved_grease_last
+                    .as_ref()
+                    .map(|p| p.bytes()),
+                Some(body)
+            );
+            assert_eq!(exts.get_encoding(), bytes);
+        }
     }
 
     #[test]
