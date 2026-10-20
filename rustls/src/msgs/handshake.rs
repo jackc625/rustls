@@ -3032,14 +3032,14 @@ impl EchConfigContents {
     }
 
     /// Returns true if there is at least one mandatory unsupported extension.
+    ///
+    /// rustls supports no ECHConfig extensions, so any mandatory one makes the config unusable,
+    /// whatever its type: a type rustls names (like the fork's GREASE codepoints) counts too.
     pub(crate) fn has_unknown_mandatory_extension(&self) -> bool {
         self.extensions
             .iter()
             // An extension is considered mandatory if the high bit of its type is set.
-            .any(|ext| {
-                matches!(ext.ext_type(), ExtensionType::Unknown(_))
-                    && u16::from(ext.ext_type()) & 0x8000 != 0
-            })
+            .any(|ext| u16::from(ext.ext_type()) & 0x8000 != 0)
     }
 }
 
@@ -3388,6 +3388,54 @@ mod tests {
 
         assert!(!config.has_duplicate_extension());
         assert!(config.has_unknown_mandatory_extension());
+    }
+
+    #[test]
+    fn test_ech_config_named_mandatory_exts() {
+        // rustls supports no ECHConfig extensions, so a mandatory one (high bit set) makes the
+        // config unusable even when rustls names its type. The first is BoGo's
+        // `TLS-ECH-Client-SelectECHConfig` case.
+        for wire in [
+            &[0xaa, 0xaa, 0x00, 0x04, b't', b'e', b's', b't'][..],
+            &[0xba, 0xba, 0x00, 0x00][..],
+            &[0xca, 0x34, 0x00, 0x00][..],
+            &[0xfe, 0x0d, 0x00, 0x00][..],
+            &[0xff, 0x01, 0x00, 0x00][..],
+        ] {
+            let config = config_with_ext(wire);
+            let typ = config.extensions[0].ext_type();
+            let code = u16::from(typ);
+            assert!(
+                config.has_unknown_mandatory_extension(),
+                "mandatory {typ:?} ({code:#06x}) not reported"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ech_config_optional_exts() {
+        // An extension with the high bit clear is optional, named or not.
+        for wire in [
+            &[0x00, 0x10, 0x00, 0x00][..],
+            &[0x12, 0x34, 0x00, 0x01, 0x00][..],
+        ] {
+            let config = config_with_ext(wire);
+            let typ = config.extensions[0].ext_type();
+            let code = u16::from(typ);
+            assert!(
+                !config.has_unknown_mandatory_extension(),
+                "optional {typ:?} ({code:#06x}) reported as mandatory"
+            );
+        }
+    }
+
+    /// `config_template()` with one extension, parsed from its wire encoding.
+    fn config_with_ext(wire: &[u8]) -> EchConfigContents {
+        let mut config = config_template();
+        config
+            .extensions
+            .push(EchConfigExtension::read_bytes(wire).unwrap());
+        config
     }
 
     fn config_template() -> EchConfigContents {
