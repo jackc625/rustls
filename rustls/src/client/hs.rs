@@ -308,22 +308,6 @@ fn emit_client_hello_for_retry(
         if let Some(record_size_limit) = ext_config.record_size_limit {
             exts.record_size_limit = Some(record_size_limit);
         }
-
-        // `signature_schemes` comes from the verifier, which never holds GREASE: add it here, at
-        // the fingerprint's position.
-        if let (Some(position), Some(schemes)) = (
-            fingerprint.signature_algorithm_grease_position(),
-            &mut exts.signature_schemes,
-        ) {
-            schemes.insert(
-                // The verifier's list isn't always built from the fingerprint (e.g.
-                // `NoVerifier::with_default_schemes()` when TLS errors are ignored), so the
-                // counted position is clamped to its length.
-                position.min(schemes.len()),
-                crate::crypto::emulation::FingerprintSignatureAlgorithm::Grease
-                    .to_signature_scheme(),
-            );
-        }
     }
 
     if !config
@@ -334,6 +318,26 @@ fn emit_client_hello_for_retry(
     {
         if let Some(schemes) = &mut exts.signature_schemes {
             schemes.retain(|scheme| scheme.algorithm().is_some());
+        }
+    }
+
+    // `signature_schemes` comes from the verifier, and neither the fingerprint's verifier nor
+    // `NoVerifier` holds GREASE: add it here, at the fingerprint's position. This must come after
+    // the filter above, which would drop it (`0x1a1a` has no `algorithm()`).
+    #[cfg(feature = "impit")]
+    if let Some(ref fingerprint) = config.tls_fingerprint {
+        if let Some(schemes) = &mut exts.signature_schemes {
+            if let Some(position) = fingerprint.signature_algorithm_grease_position(schemes) {
+                // With the fingerprint's own verifier the count can't pass the end: its list
+                // keeps duplicates, and the filter drops every copy of a scheme together.
+                // Other verifiers' lists aren't built from the fingerprint (e.g.
+                // `NoVerifier::with_default_schemes()` when TLS errors are ignored), so clamp.
+                schemes.insert(
+                    position.min(schemes.len()),
+                    crate::crypto::emulation::FingerprintSignatureAlgorithm::Grease
+                        .to_signature_scheme(),
+                );
+            }
         }
     }
 

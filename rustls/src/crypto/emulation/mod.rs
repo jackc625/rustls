@@ -625,11 +625,17 @@ impl TlsFingerprint {
         sig_alg_cache::get_or_create(&self.signature_algorithms)
     }
 
-    /// Where GREASE goes in the ClientHello's `signature_algorithms`, if the fingerprint lists it.
+    /// The number of entries before the first `Grease` whose scheme is in `sent`, the
+    /// ClientHello's `signature_algorithms`, or `None` if the fingerprint doesn't list GREASE.
     ///
-    /// That list comes from the verification algorithms, which hold only the entries that have a
-    /// mapping, so the position counts only those.
-    pub(crate) fn signature_algorithm_grease_position(&self) -> Option<usize> {
+    /// With the fingerprint's own verifier this never exceeds `sent.len()`: `sent` is the
+    /// fingerprint's order with entries removed (those without a mapping, and those upstream's
+    /// TLS 1.2 filter drops). With another verifier's list (e.g. `NoVerifier`) it may, and the
+    /// caller clamps.
+    pub(crate) fn signature_algorithm_grease_position(
+        &self,
+        sent: &[SignatureScheme],
+    ) -> Option<usize> {
         let grease = self
             .signature_algorithms
             .iter()
@@ -637,7 +643,7 @@ impl TlsFingerprint {
         Some(
             self.signature_algorithms[..grease]
                 .iter()
-                .filter(|sa| sa.to_mapping_entry().is_some())
+                .filter(|sa| sent.contains(&sa.to_signature_scheme()))
                 .count(),
         )
     }
@@ -657,14 +663,19 @@ mod tests {
 
     use super::*;
     use crate::crypto::CryptoProvider;
+    #[cfg(feature = "tls12")]
+    use crate::server::Acceptor;
     use crate::server::{ClientHello, ResolvesServerCert, WantsServerCert};
     use crate::sign::{CertifiedKey, Signer, SigningKey, SingleCertAndKey};
     use crate::sync::Arc;
-    use crate::verify::DigitallySignedStruct;
+    use crate::verify::{DigitallySignedStruct, NoVerifier};
+    #[cfg(feature = "tls12")]
+    use crate::version::TLS12;
     use crate::version::TLS13;
     use crate::{
         CertificateError, ClientConfig, ClientConnection, ConfigBuilder, Connection, Error,
         PeerMisbehaved, RootCertStore, ServerConfig, ServerConnection, SignatureAlgorithm,
+        SupportedProtocolVersion,
     };
 
     #[test]
@@ -744,11 +755,20 @@ mod tests {
 
     /// Like `client_config`, for an arbitrary fingerprint (set on both the provider and the config).
     fn client_config_with(fp: TlsFingerprint, roots: RootCertStore) -> ClientConfig {
+        client_config_for(fp, roots, &[&TLS13])
+    }
+
+    /// Like `client_config_with`, offering only `versions`.
+    fn client_config_for(
+        fp: TlsFingerprint,
+        roots: RootCertStore,
+        versions: &[&'static SupportedProtocolVersion],
+    ) -> ClientConfig {
         let provider = CryptoProvider::builder()
             .with_tls_fingerprint(fp.clone())
             .build();
         ClientConfig::builder_with_provider(Arc::new(provider))
-            .with_protocol_versions(&[&TLS13])
+            .with_protocol_versions(versions)
             .unwrap()
             .with_root_certificates(roots)
             .with_tls_fingerprint(fp)
@@ -757,11 +777,14 @@ mod tests {
 
     /// The ClientHello extensions `fp` produces, as (type, body) in wire order.
     fn client_hello_extensions(fp: TlsFingerprint) -> Vec<(u16, Vec<u8>)> {
-        let mut conn = ClientConnection::new(
-            Arc::new(client_config_with(fp, RootCertStore::empty())),
-            ServerName::try_from("localhost").unwrap(),
-        )
-        .unwrap();
+        hello_extensions(client_config_with(fp, RootCertStore::empty()))
+    }
+
+    /// The ClientHello extensions `config` produces, as (type, body) in wire order.
+    fn hello_extensions(config: ClientConfig) -> Vec<(u16, Vec<u8>)> {
+        let mut conn =
+            ClientConnection::new(Arc::new(config), ServerName::try_from("localhost").unwrap())
+                .unwrap();
         let mut record = Vec::new();
         conn.write_tls(&mut record).unwrap();
 
@@ -849,10 +872,37 @@ mod tests {
 
     /// The `signature_algorithms` extension body `fp` sends.
     fn sent_signature_algorithms(fp: TlsFingerprint) -> Option<Vec<u8>> {
-        client_hello_extensions(fp)
+        signature_algorithms_sent_by(client_config_with(fp, RootCertStore::empty()))
+    }
+
+    /// The `signature_algorithms` extension body `config` sends.
+    fn signature_algorithms_sent_by(config: ClientConfig) -> Option<Vec<u8>> {
+        hello_extensions(config)
             .into_iter()
             .find(|(t, _)| *t == 0x000d)
             .map(|(_, body)| body)
+    }
+
+    /// `fingerprint()` with `signature_algorithms` and a single TLS 1.2 suite, so that upstream's
+    /// filter of TLS-1.3-only signature schemes applies.
+    ///
+    /// Exactly one suite: the GREASE suite, and the ECDHE CBC and static-RSA suites, are fake
+    /// TLS 1.3 suites in this fork, so listing any of them would switch the filter off.
+    #[cfg(feature = "tls12")]
+    fn tls12_fingerprint(
+        signature_algorithms: Vec<FingerprintSignatureAlgorithm>,
+    ) -> TlsFingerprint {
+        let mut fp = fingerprint();
+        fp.cipher_suites = vec![FingerprintCipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256];
+        fp.signature_algorithms = signature_algorithms;
+        fp
+    }
+
+    /// A client for a `tls12_fingerprint`. It offers TLS 1.2 only: its provider has no TLS 1.3
+    /// suite, so a TLS 1.3 client can't be built from it.
+    #[cfg(feature = "tls12")]
+    fn tls12_client_config(fp: TlsFingerprint, roots: RootCertStore) -> ClientConfig {
+        client_config_for(fp, roots, &[&TLS12])
     }
 
     #[test]
@@ -872,6 +922,103 @@ mod tests {
         assert_eq!(
             sent_signature_algorithms(fp),
             Some(vec![0x00, 0x04, 0x1a, 0x1a, 0x04, 0x03])
+        );
+
+        // Only the entries that are sent count: ECDSA does, Ed448 doesn't.
+        let mut fp = fingerprint();
+        fp.signature_algorithms = vec![
+            FingerprintSignatureAlgorithm::EcdsaSecp256r1Sha256,
+            FingerprintSignatureAlgorithm::Ed448,
+            FingerprintSignatureAlgorithm::Grease,
+            FingerprintSignatureAlgorithm::RsaPssRsaSha256,
+        ];
+        assert_eq!(
+            sent_signature_algorithms(fp),
+            Some(vec![0x00, 0x06, 0x04, 0x03, 0x1a, 0x1a, 0x08, 0x04])
+        );
+    }
+
+    #[cfg(feature = "tls12")]
+    #[test]
+    fn grease_signature_algorithm_survives_tls12_only_suites() {
+        let fp = tls12_fingerprint(vec![
+            FingerprintSignatureAlgorithm::Grease,
+            FingerprintSignatureAlgorithm::EcdsaSecp256r1Sha256,
+            FingerprintSignatureAlgorithm::RsaPssRsaSha256,
+        ]);
+        assert_eq!(
+            signature_algorithms_sent_by(tls12_client_config(fp, RootCertStore::empty())),
+            Some(vec![0x00, 0x06, 0x1a, 0x1a, 0x04, 0x03, 0x08, 0x04])
+        );
+    }
+
+    #[cfg(feature = "tls12")]
+    #[test]
+    fn tls12_only_grease_position_skips_filtered_schemes() {
+        // Upstream's filter drops ML-DSA, so it doesn't count towards GREASE's position.
+        let fp = tls12_fingerprint(vec![
+            FingerprintSignatureAlgorithm::MlDsa44,
+            FingerprintSignatureAlgorithm::Grease,
+            FingerprintSignatureAlgorithm::EcdsaSecp256r1Sha256,
+        ]);
+        assert_eq!(
+            signature_algorithms_sent_by(tls12_client_config(fp, RootCertStore::empty())),
+            Some(vec![0x00, 0x04, 0x1a, 0x1a, 0x04, 0x03])
+        );
+    }
+
+    #[test]
+    fn grease_position_with_no_verifier_list() {
+        // With `ignore_tls_errors`, impit swaps in NoVerifier, whose fixed list isn't built from
+        // the fingerprint. GREASE's position is counted over that list.
+        let sent_with_no_verifier = |signature_algorithms| {
+            let mut fp = fingerprint();
+            fp.signature_algorithms = signature_algorithms;
+            let mut config = client_config_with(fp, RootCertStore::empty());
+            config
+                .dangerous()
+                .set_certificate_verifier(Arc::new(NoVerifier::with_default_schemes()));
+            signature_algorithms_sent_by(config)
+        };
+
+        assert_eq!(
+            sent_with_no_verifier(vec![
+                FingerprintSignatureAlgorithm::Grease,
+                FingerprintSignatureAlgorithm::EcdsaSecp256r1Sha256,
+                FingerprintSignatureAlgorithm::RsaPssRsaSha256,
+            ]),
+            Some(vec![
+                0x00, 0x1c, 0x1a, 0x1a, 0x02, 0x01, 0x02, 0x03, 0x04, 0x01, 0x04, 0x03, 0x05, 0x01,
+                0x05, 0x03, 0x06, 0x01, 0x06, 0x03, 0x08, 0x04, 0x08, 0x05, 0x08, 0x06, 0x08, 0x07,
+                0x08, 0x08,
+            ])
+        );
+
+        // The count, 14, passes NoVerifier's 13 entries, so the clamp puts GREASE last.
+        let mut signature_algorithms =
+            vec![FingerprintSignatureAlgorithm::EcdsaSecp256r1Sha256; 14];
+        signature_algorithms.push(FingerprintSignatureAlgorithm::Grease);
+        assert_eq!(
+            sent_with_no_verifier(signature_algorithms),
+            Some(vec![
+                0x00, 0x1c, 0x02, 0x01, 0x02, 0x03, 0x04, 0x01, 0x04, 0x03, 0x05, 0x01, 0x05, 0x03,
+                0x06, 0x01, 0x06, 0x03, 0x08, 0x04, 0x08, 0x05, 0x08, 0x06, 0x08, 0x07, 0x08, 0x08,
+                0x1a, 0x1a,
+            ])
+        );
+
+        // Ed448 is in NoVerifier's list, so it counts and GREASE goes at index 1.
+        assert_eq!(
+            sent_with_no_verifier(vec![
+                FingerprintSignatureAlgorithm::Ed448,
+                FingerprintSignatureAlgorithm::Grease,
+                FingerprintSignatureAlgorithm::EcdsaSecp256r1Sha256,
+            ]),
+            Some(vec![
+                0x00, 0x1c, 0x02, 0x01, 0x1a, 0x1a, 0x02, 0x03, 0x04, 0x01, 0x04, 0x03, 0x05, 0x01,
+                0x05, 0x03, 0x06, 0x01, 0x06, 0x03, 0x08, 0x04, 0x08, 0x05, 0x08, 0x06, 0x08, 0x07,
+                0x08, 0x08,
+            ])
         );
     }
 
@@ -961,6 +1108,42 @@ mod tests {
         assert_eq!(*resolver.seen.lock().unwrap(), vec![sent.clone(), sent]);
     }
 
+    #[cfg(feature = "tls12")]
+    #[test]
+    fn tls12_handshake_with_grease_sigalg_succeeds() {
+        let fp = tls12_fingerprint(vec![
+            FingerprintSignatureAlgorithm::Grease,
+            FingerprintSignatureAlgorithm::EcdsaSecp256r1Sha256,
+            FingerprintSignatureAlgorithm::RsaPssRsaSha256,
+        ]);
+        let (roots, ee_cert, ee_key) = issue(
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+        );
+        let server_config =
+            ServerConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+                .with_protocol_versions(&[&TLS12])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![ee_cert], ee_key)
+                .unwrap();
+
+        // Not `RecordSignatureSchemes`: before calling the cert resolver, the server drops the
+        // schemes that don't suit the shared suites (here GREASE and RSA-PSS).
+        let received =
+            handshake_through_acceptor(tls12_client_config(fp, roots), server_config).unwrap();
+
+        // One list, not one per hello: the `Acceptor` sees only the first ClientHello.
+        assert_eq!(
+            received,
+            vec![
+                SignatureScheme::Unknown(0x1a1a),
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PSS_SHA256,
+            ]
+        );
+    }
+
     /// Serves one certificate, recording the `signature_algorithms` of each ClientHello.
     #[derive(Debug)]
     struct RecordSignatureSchemes {
@@ -1031,10 +1214,57 @@ mod tests {
             .unwrap(),
         );
         let mut server = Connection::from(ServerConnection::new(Arc::new(server_config)).unwrap());
+        finish_handshake(&mut client, &mut server)
+    }
 
+    /// Like `handshake`, with the server started from an `Acceptor`. Returns the signature schemes
+    /// of the ClientHello as the server received it.
+    #[cfg(feature = "tls12")]
+    fn handshake_through_acceptor(
+        client_config: ClientConfig,
+        server_config: ServerConfig,
+    ) -> Result<Vec<SignatureScheme>, Error> {
+        let mut client = Connection::from(
+            ClientConnection::new(
+                Arc::new(client_config),
+                ServerName::try_from("localhost").unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let mut buf = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut buf).unwrap();
+        }
+        let mut acceptor = Acceptor::default();
+        let mut rd = &buf[..];
+        while !rd.is_empty() {
+            let read = acceptor.read_tls(&mut rd).unwrap();
+            assert_ne!(read, 0, "read_tls made no progress");
+        }
+        let accepted = acceptor
+            .accept()
+            .map_err(|(err, _)| err)?
+            .expect("ClientHello incomplete");
+        let received = accepted
+            .client_hello()
+            .signature_schemes()
+            .to_vec();
+
+        let mut server = Connection::from(
+            accepted
+                .into_connection(Arc::new(server_config))
+                .map_err(|(err, _)| err)?,
+        );
+        finish_handshake(&mut client, &mut server)?;
+        Ok(received)
+    }
+
+    /// Exchanges flights until neither side is handshaking.
+    fn finish_handshake(client: &mut Connection, server: &mut Connection) -> Result<(), Error> {
         while client.is_handshaking() || server.is_handshaking() {
-            let client_sent = transfer(&mut client, &mut server)?;
-            let server_sent = transfer(&mut server, &mut client)?;
+            let client_sent = transfer(client, server)?;
+            let server_sent = transfer(server, client)?;
             assert!(client_sent || server_sent, "handshake stalled");
         }
         Ok(())
